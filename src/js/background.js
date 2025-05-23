@@ -1,3 +1,18 @@
+importScripts(
+  'js/gsUtils.js',
+  'js/gsChrome.js',
+  'js/gsStorage.js',
+  'js/db.js',
+  'js/gsIndexedDb.js',
+  'js/gsMessages.js',
+  'js/gsSession.js',
+  'js/gsTabQueue.js',
+  'js/gsTabCheckManager.js',
+  'js/gsFavicon.js',
+  'js/gsTabSuspendManager.js',
+  'js/gsTabDiscardManager.js',
+  'js/gsSuspendedTab.js'
+);
 /* global gsStorage, gsChrome, gsIndexedDb, gsUtils, gsFavicon, gsSession, gsMessages, gsTabSuspendManager, gsTabDiscardManager, gsTabCheckManager, gsSuspendedTab, chrome, XMLHttpRequest */
 /*
  * The Great Suspender
@@ -996,9 +1011,11 @@ var tgs = (function() {
       const oldHotkey = _suspensionToggleHotkey;
       _suspensionToggleHotkey = await buildSuspensionToggleHotkey();
       if (oldHotkey !== _suspensionToggleHotkey) {
-        const suspendedViews = getInternalViewsByViewName('suspended');
-        for (const suspendedView of suspendedViews) {
-          gsSuspendedTab.updateCommand(suspendedView, _suspensionToggleHotkey);
+        //Instead of getInternalViewsByViewName, query for suspended tabs and send a message
+        const suspendedTabs = await gsChrome.tabsQuery({ url: chrome.runtime.getURL('suspended.html') + '*' });
+        for (const sTab of suspendedTabs) {
+          // gsSuspendedTab.updateCommand now takes tabId as the first argument
+          gsSuspendedTab.updateCommand(sTab.id, _suspensionToggleHotkey);
         }
       }
       _triggerHotkeyUpdate = false;
@@ -1122,12 +1139,14 @@ var tgs = (function() {
           gsTabSuspendManager.unqueueTabForSuspension(focusedTab);
         }
       }
-    } else if (focusedTab.url === chrome.extension.getURL('options.html')) {
-      const optionsView = getInternalViewByTabId(focusedTab.id);
-      if (optionsView && optionsView.exports) {
-        optionsView.exports.initSettings();
-      }
     }
+    // Removed options.html specific initialisation call from background:
+    // else if (focusedTab.url === chrome.runtime.getURL('options.html')) {
+    //   const optionsView = getInternalViewByTabId(focusedTab.id);
+    //   if (optionsView && optionsView.exports && typeof optionsView.exports.initSettings === 'function') {
+    //     optionsView.exports.initSettings();
+    //   }
+    // }
 
     //Reset timer on tab that lost focus.
     //NOTE: This may be due to a change in window focus in which case the tab may still have .active = true
@@ -1160,10 +1179,8 @@ var tgs = (function() {
       if (navigator.onLine) {
         unsuspendTab(focusedTab);
       } else {
-        const suspendedView = getInternalViewByTabId(focusedTab.id);
-        if (suspendedView) {
-          gsSuspendedTab.showNoConnectivityMessage(suspendedView);
-        }
+        // gsSuspendedTab.showNoConnectivityMessage now takes tabId
+        gsSuspendedTab.showNoConnectivityMessage(focusedTab.id);
       }
     }
   }
@@ -1171,7 +1188,7 @@ var tgs = (function() {
   function promptForFilePermissions() {
     getCurrentlyActiveTab(activeTab => {
       chrome.tabs.create({
-        url: chrome.extension.getURL('permissions.html'),
+        url: chrome.runtime.getURL('permissions.html'), // Use chrome.runtime.getURL
         index: activeTab.index + 1,
       });
     });
@@ -1731,7 +1748,7 @@ var tgs = (function() {
 
       var noticeToDisplay = requestNotice();
       if (noticeToDisplay) {
-        chrome.tabs.create({ url: chrome.extension.getURL('notice.html') });
+        chrome.tabs.create({ url: chrome.runtime.getURL('notice.html') }); // Use chrome.runtime.getURL
       }
     });
     chrome.windows.onRemoved.addListener(function(windowId) {

@@ -1,11 +1,9 @@
-/*global chrome, gsStorage, gsChrome, gsUtils */
+/*global chrome, gsStorage, gsChrome, gsUtils, console */ // Added console for logging
 (function(global) {
-  try {
-    chrome.extension.getBackgroundPage().tgs.setViewGlobals(global);
-  } catch (e) {
-    window.setTimeout(() => window.location.reload(), 1000);
-    return;
-  }
+  // MV3: Direct background page access is not allowed.
+  // Necessary utilities like gsStorage, gsUtils should be available if options.html includes them,
+  // or communication should happen via chrome.runtime.sendMessage.
+  // For gsStorage, its methods are now async. gsUtils might also have async methods.
 
   var elementPrefMap = {
     preview: gsStorage.SCREEN_CAPTURE,
@@ -42,29 +40,38 @@
   }
 
   //populate settings from synced storage
-  function initSettings() {
+  async function initSettings() { // Made async
     //Set theme
-    document.body.classList.add(gsStorage.getOption(gsStorage.THEME) === 'dark' ? 'dark' : null);
+    try {
+      document.body.classList.toggle('dark', await gsStorage.getOption(gsStorage.THEME) === 'dark');
 
-    var optionEls = document.getElementsByClassName('option'),
-      pref,
-      element,
-      i;
-    for (i = 0; i < optionEls.length; i++) {
-      element = optionEls[i];
-      pref = elementPrefMap[element.id];
-      populateOption(element, gsStorage.getOption(pref));
+      var optionEls = document.getElementsByClassName('option'),
+        pref,
+        element,
+        i;
+      for (i = 0; i < optionEls.length; i++) {
+        element = optionEls[i];
+        pref = elementPrefMap[element.id];
+        if (pref) { // Ensure pref exists to avoid errors
+          populateOption(element, await gsStorage.getOption(pref));
+        } else {
+          console.warn('No preference mapping for element id:', element.id);
+        }
+      }
+
+      addClickHandlers();
+
+      setForceScreenCaptureVisibility(
+        await gsStorage.getOption(gsStorage.SCREEN_CAPTURE) !== '0',
+      );
+      setAutoSuspendOptionsVisibility(
+        parseFloat(await gsStorage.getOption(gsStorage.SUSPEND_TIME)) > 0,
+      );
+      setSyncNoteVisibility(!await gsStorage.getOption(gsStorage.SYNC_SETTINGS));
+    } catch (e) {
+      console.error("Error during initSettings:", e);
+      // Potentially display an error message to the user on the options page
     }
-
-    addClickHandlers();
-
-    setForceScreenCaptureVisibility(
-      gsStorage.getOption(gsStorage.SCREEN_CAPTURE) !== '0',
-    );
-    setAutoSuspendOptionsVisibility(
-      parseFloat(gsStorage.getOption(gsStorage.SUSPEND_TIME)) > 0,
-    );
-    setSyncNoteVisibility(!gsStorage.getOption(gsStorage.SYNC_SETTINGS));
 
     let searchParams = new URL(location.href).searchParams;
     if (searchParams.has('firstTime')) {
@@ -158,7 +165,7 @@
   }
 
   function handleChange(element) {
-    return function() {
+    return async function() { // Made async
       var pref = elementPrefMap[element.id],
         interval;
 
@@ -175,25 +182,32 @@
         }
       } else if (pref === gsStorage.THEME) {
         // when the user changes the theme, it reloads the page to apply instantly the modification
+        // Before reloading, ensure the setting is saved
+        await saveChange(element); // Ensure save completes
         window.location.reload();
+        return; // Return early as page is reloading
       }
 
-      var [oldValue, newValue] = saveChange(element);
+      var [oldValue, newValue] = await saveChange(element); // Made await
       if (oldValue !== newValue) {
         var prefKey = elementPrefMap[element.id];
-        gsUtils.performPostSaveUpdates(
-          [prefKey],
-          { [prefKey]: oldValue },
-          { [prefKey]: newValue },
-        );
+        // Assuming gsUtils.performPostSaveUpdates is either synchronous or doesn't need to be awaited for handleChange to complete
+        // If it becomes async and critical for subsequent UI, it should be awaited.
+        if (typeof gsUtils.performPostSaveUpdates === 'function') {
+            gsUtils.performPostSaveUpdates(
+              [prefKey],
+              { [prefKey]: oldValue },
+              { [prefKey]: newValue },
+            );
+        }
       }
     };
   }
 
-  function saveChange(element) {
-    var pref = elementPrefMap[element.id],
-      oldValue = gsStorage.getOption(pref),
-      newValue = getOptionValue(element);
+  async function saveChange(element) { // Made async
+    var pref = elementPrefMap[element.id];
+    var oldValue = await gsStorage.getOption(pref); // Made await
+    var newValue = getOptionValue(element);
 
     //clean up whitelist before saving
     if (pref === gsStorage.WHITELIST) {
@@ -202,14 +216,14 @@
 
     //save option
     if (oldValue !== newValue) {
-      gsStorage.setOptionAndSync(elementPrefMap[element.id], newValue);
+      await gsStorage.setOptionAndSync(elementPrefMap[element.id], newValue); // Made await
     }
 
     return [oldValue, newValue];
   }
 
-  gsUtils.documentReadyAndLocalisedAsPromised(document).then(function() {
-    initSettings();
+  gsUtils.documentReadyAndLocalisedAsPromised(document).then(async function() { // Made async
+    await initSettings(); // Made await
 
     var optionEls = document.getElementsByClassName('option'),
       element,

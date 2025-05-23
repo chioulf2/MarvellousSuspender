@@ -590,10 +590,13 @@ var gsUtils = {
     return currentSuspendedTabs.length;
   },
 
-  htmlEncode: function(text) {
-    return document
-      .createElement('pre')
-      .appendChild(document.createTextNode(text)).parentNode.innerHTML;
+  htmlEncode: function(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
   },
 
   getChromeVersion: function() {

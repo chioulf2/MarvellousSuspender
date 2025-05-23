@@ -1,210 +1,242 @@
-/*global gsUtils, gsIndexedDb */
+/*global gsUtils, gsIndexedDb, chrome */
 // eslint-disable-next-line no-unused-vars
 var gsFavicon = (function() {
   'use strict';
 
-  // const GOOGLE_S2_URL = 'https://www.google.com/s2/favicons?domain_url=';
-  const FALLBACK_CHROME_FAVICON_META = {
-    favIconUrl: 'chrome://favicon/size/16@2x/fallbackChromeFaviconMeta',
-    isDark: true,
-    normalisedDataUrl:
-      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYklEQVQ4T2NkoBAwIuuPior6j8O8xmXLljVgk8MwYNmyZdgMfcjAwLAAmyFEGfDv3z9FJiamA9gMIcoAkKsiIiIUsBlClAHofkf2JkED0DWDAnrUgOEfBsRkTpzpgBjN6GoA24V1Efr1zoAAAAAASUVORK5CYII=',
-    transparentDataUrl:
-      'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAaUlEQVQ4T2NkoBAwIuuPioqqx2YeExPTwSVLlhzAJodhwLJlyxrRDWVkZPzIyMh4AZshRBnAxsY28ffv3wnYDCHKAJCrEhISBLAZQpQB6H5H9iZBA9A1gwJ61IDhHwbEZE6c6YAYzehqAAmQeBHM42eMAAAAAElFTkSuQmCC',
+  const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
+
+  const GOOGLE_S2_URL = 'https://www.google.com/s2/favicons?sz=32&domain_url='; // Using 32px for better quality
+  const FALLBACK_DEFAULT_FAVICON_META = { // Renamed and updated
+    favIconUrl: 'img/chromeDefaultFavicon.png', // Placeholder, will be processed
+    isDark: true, // Assuming default is dark, can be refined by processing the actual default icon
+    // These will be populated by processing the actual default icon in initAsPromised
+    normalisedDataUrl: '', 
+    transparentDataUrl: '',
   };
 
   const _defaultFaviconFingerprintById = {};
-  let _defaultChromeFaviconMeta;
+  let _processedDefaultFaviconMeta; // Renamed
+  let creatingOffscreenDocument = null;
+
+
+  async function hasOffscreenDocument() {
+    if (chrome.runtime.getContexts) { // Check if getContexts is available (MV3)
+        const contexts = await chrome.runtime.getContexts({
+            contextTypes: ['OFFSCREEN_DOCUMENT'],
+            documentUrls: [chrome.runtime.getURL(OFFSCREEN_DOCUMENT_PATH)]
+        });
+        return !!contexts && contexts.length > 0;
+    }
+    return false; // Fallback for environments where getContexts isn't available (e.g. older Chrome versions or non-MV3)
+  }
+
+  async function createOffscreenDocument() {
+    if (creatingOffscreenDocument) {
+      await creatingOffscreenDocument;
+      return;
+    }
+    if (!(await hasOffscreenDocument())) {
+      creatingOffscreenDocument = chrome.offscreen.createDocument({
+        url: OFFSCREEN_DOCUMENT_PATH,
+        reasons: [chrome.offscreen.Reason.CANVAS_CONTEXT_CREATION, chrome.offscreen.Reason.DOM_PARSER], // DOM_SCRAPING might be too broad.
+        justification: 'Processing favicons using Image and Canvas',
+      });
+      await creatingOffscreenDocument;
+      creatingOffscreenDocument = null;
+    }
+  }
+
+  async function sendMessageToOffscreenDocument(action, payload) {
+    await createOffscreenDocument(); // Ensure document exists
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: 'offscreen', // Optional: helps target if multiple message listeners
+        action: action,
+        ...payload,
+      });
+      if (response && response.success) {
+        return response.data;
+      } else {
+        const errorMessage = response && response.error ? response.error : 'Unknown error in offscreen document.';
+        console.warn(`Offscreen document error for action ${action}:`, errorMessage);
+        throw new Error(`Offscreen: ${errorMessage}`);
+      }
+    } catch (e) {
+        // Handle cases where the offscreen document might have been closed or an error occurred
+        console.error(`Error sending message to offscreen document for action ${action}:`, e);
+        // Attempt to close and recreate the document if it seems to be an issue with the document itself
+        if (e.message.includes("Could not establish connection") || e.message.includes("Target context invalidated")) {
+            try {
+                await chrome.offscreen.closeDocument();
+            } catch (closeError) {
+                // Ignore errors during close, might already be closed or in a bad state
+            }
+            // Retry sending the message once after attempting to recreate.
+            // This avoids an infinite loop if recreation also fails.
+            await createOffscreenDocument();
+             const retryResponse = await chrome.runtime.sendMessage({
+                target: 'offscreen',
+                action: action,
+                ...payload,
+            });
+            if (retryResponse && retryResponse.success) {
+                return retryResponse.data;
+            } else {
+                 const retryErrorMessage = retryResponse && retryResponse.error ? retryResponse.error : 'Unknown error after retry.';
+                 throw new Error(`Offscreen (after retry): ${retryErrorMessage}`);
+            }
+        }
+        throw e; // Re-throw original error if not a connection issue or if retry failed
+    }
+  }
+
 
   async function initAsPromised() {
-    await addFaviconDefaults();
+    // Process the actual default icon to populate FALLBACK_DEFAULT_FAVICON_META
+    try {
+        const defaultIconPath = chrome.runtime.getURL(FALLBACK_DEFAULT_FAVICON_META.favIconUrl);
+        const processedMeta = await buildFaviconMetaData(defaultIconPath);
+        if (processedMeta) {
+            FALLBACK_DEFAULT_FAVICON_META.normalisedDataUrl = processedMeta.normalisedDataUrl;
+            FALLBACK_DEFAULT_FAVICON_META.transparentDataUrl = processedMeta.transparentDataUrl;
+            FALLBACK_DEFAULT_FAVICON_META.isDark = processedMeta.isDark; // Update isDark based on actual processing
+        }
+    } catch (e) {
+        gsUtils.warning('gsFavicon', `Failed to process default favicon: ${e}. Using hardcoded fallback values.`);
+        // Fallback to hardcoded values if processing fails (already set partially)
+        FALLBACK_DEFAULT_FAVICON_META.normalisedDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYklEQVQ4T2NkoBAwIuuPior6j8O8xmXLljVgk8MwYNmyZdgMfcjAwLAAmyFEGfDv3z9FJiamA9gMIcoAkKsiIiIUsBlClAHofkf2JkED0DWDAnrUgOEfBsRkTpzpgBjN6GoA24V1Efr1zoAAAAAASUVORK5CYII=';
+        FALLBACK_DEFAULT_FAVICON_META.transparentDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAaUlEQVQ4T2NkoBAwIuuPioqqx2YeExPTwSVLlhzAJodhwLJlyxrRDWVkZPzIyMh4AZshRBnAxsY28ffv3wnYDCHKAJCrEhISBLAZQpQB6H5H9iZBA9A1gwJ61IDhHwbEZE6c6YAYzehqAAmQeBHM42eMAAAAAElFTkSuQmCC';
+    }
+    _processedDefaultFaviconMeta = FALLBACK_DEFAULT_FAVICON_META;
+    await addFaviconDefaults(); // For other default-like icons (e.g. suspendy icon)
     gsUtils.log('gsFavicon', 'init successful');
   }
 
   async function addFaviconDefaults() {
-    // Generate a list of potential 'default' favicons so we can avoid caching
-    // anything that matches these defaults
+    // These are icons that, if detected, should be treated as "no real favicon"
     const defaultIconUrls = [
-      generateChromeFavIconUrlFromUrl('http://chromeDefaultFavicon'),
-      generateChromeFavIconUrlFromUrl('chromeDefaultFavicon'),
-      chrome.extension.getURL('img/ic_suspendy_16x16.png'),
-      chrome.extension.getURL('img/chromeDefaultFavicon.png'),
-      chrome.extension.getURL('img/chromeDefaultFaviconSml.png'),
-      chrome.extension.getURL('img/chromeDevDefaultFavicon.png'),
-      chrome.extension.getURL('img/chromeDevDefaultFaviconSml.png'),
+      // chrome.runtime.getURL('img/chromeDefaultFavicon.png'), // This is now the primary _processedDefaultFaviconMeta
+      chrome.runtime.getURL('img/ic_suspendy_16x16.png'),
+      // Add any other icons that represent a "default" or "missing" state
     ];
 
-    const faviconPromises = [];
-    for (let i = 0; i < defaultIconUrls.length; i += 1) {
-      const iconUrl = defaultIconUrls[i];
-      faviconPromises.push(
-        new Promise(async resolve => {
-          const faviconMeta = await addDefaultFaviconMeta(iconUrl);
-          if (faviconMeta) {
-            gsUtils.log(
-              'gsFavicon',
-              `Successfully built default faviconMeta for url: ${iconUrl}`,
-              faviconMeta
-            );
-          } else {
-            gsUtils.warning(
-              'gsFavicon',
-              `Failed to build faviconMeta for url: ${iconUrl}`
-            );
-          }
-          // Set the first url as the default favicon
-          if (i === 0) {
-            _defaultChromeFaviconMeta =
-              faviconMeta || FALLBACK_CHROME_FAVICON_META;
-            gsUtils.log(
-              'gsFavicon',
-              'Set _defaultChromeFaviconMeta',
-              _defaultChromeFaviconMeta
-            );
-          }
-          resolve();
-        })
-      );
+    for (const iconUrl of defaultIconUrls) {
+      try {
+        const faviconMeta = await addDefaultFaviconMeta(iconUrl);
+        if (faviconMeta) {
+          gsUtils.log('gsFavicon', `Successfully built default-like faviconMeta for url: ${iconUrl}`);
+        } else {
+          gsUtils.warning('gsFavicon', `Failed to build default-like faviconMeta for url: ${iconUrl}`);
+        }
+      } catch (e) {
+         gsUtils.warning('gsFavicon', `Error processing default-like icon ${iconUrl}: ${e}`);
+      }
     }
-    await Promise.all(faviconPromises);
   }
 
   async function addDefaultFaviconMeta(url) {
     let faviconMeta;
     try {
       faviconMeta = await gsUtils.executeWithRetries(
-        buildFaviconMetaData,
+        buildFaviconMetaData, 
         [url],
-        4,
-        0
+        2, 
+        100 
       );
     } catch (e) {
-      gsUtils.warning('gsFavicon', e);
+      gsUtils.warning('gsFavicon', `addDefaultFaviconMeta failed for ${url}: ${e}`);
+      return null; 
     }
-    addFaviconMetaToDefaultFingerprints(faviconMeta, url);
+    if (faviconMeta) { 
+        await addFaviconMetaToDefaultFingerprints(faviconMeta, url);
+    }
     return faviconMeta;
   }
 
   async function addFaviconMetaToDefaultFingerprints(faviconMeta, id) {
-    _defaultFaviconFingerprintById[id] = await createImageFingerprint(
-      faviconMeta.normalisedDataUrl
-    );
-    _defaultFaviconFingerprintById[
-      id + 'Transparent'
-    ] = await createImageFingerprint(faviconMeta.transparentDataUrl);
-  }
+    if (!faviconMeta || !faviconMeta.normalisedDataUrl || !faviconMeta.transparentDataUrl) {
+        gsUtils.warning('gsFavicon', `Skipping fingerprint for ${id} due to missing dataUrl in faviconMeta.`);
+        return;
+    }
+    try {
+        const normFingerprint = await createImageFingerprint(faviconMeta.normalisedDataUrl);
+        if (normFingerprint) _defaultFaviconFingerprintById[`norm_${id}`] = normFingerprint;
 
-  function generateChromeFavIconUrlFromUrl(url) {
-    return 'chrome://favicon/size/16@2x/' + url;
+        const transFingerprint = await createImageFingerprint(faviconMeta.transparentDataUrl);
+        if (transFingerprint) _defaultFaviconFingerprintById[`trans_${id}`] = transFingerprint;
+
+    } catch (e) {
+        gsUtils.warning('gsFavicon', `Failed to create fingerprint for ${id}: ${e}`);
+    }
   }
 
   async function getFaviconMetaData(tab) {
+    if (!tab || !tab.url) return _processedDefaultFaviconMeta;
     if (gsUtils.isFileTab(tab)) {
-      return _defaultChromeFaviconMeta;
+      return _processedDefaultFaviconMeta;
     }
 
-    // First try to fetch from cache
     let originalUrl = tab.url;
     if (gsUtils.isSuspendedTab(tab)) {
       originalUrl = gsUtils.getOriginalUrl(tab.url);
+      if (!originalUrl) return _processedDefaultFaviconMeta; // Cannot determine original URL
     }
+
     let faviconMeta = await getCachedFaviconMetaData(originalUrl);
     if (faviconMeta) {
-      // gsUtils.log(
-      //   tab.id,
-      //   'Found favicon cache hit for url: ' + originalUrl,
-      //   faviconMeta
-      // );
       return faviconMeta;
     }
 
-    // Else try to build from chrome's favicon cache
-    faviconMeta = await buildFaviconMetaFromChromeFaviconCache(originalUrl);
-    if (faviconMeta) {
-      gsUtils.log(
-        tab.id,
-        'Saving faviconMeta from chrome://favicon into cache',
-        faviconMeta
-      );
-      // Save to tgs favicon cache
-      await saveFaviconMetaDataToCache(originalUrl, faviconMeta);
-      return faviconMeta;
-    }
-
-    // Else try to build from tab.favIconUrl
-    gsUtils.log(
-      tab.id,
-      'No entry in chrome favicon cache for url: ' + originalUrl
-    );
-    if (
-      tab.favIconUrl &&
-      tab.favIconUrl !== chrome.extension.getURL('img/ic_suspendy_16x16.png')
-    ) {
+    // 1. Try tab.favIconUrl directly
+    if (tab.favIconUrl && !tab.favIconUrl.startsWith('chrome://') && tab.favIconUrl !== chrome.runtime.getURL('img/ic_suspendy_16x16.png')) {
+      gsUtils.log(tab.id, `Attempting to build favicon from tab.favIconUrl: ${tab.favIconUrl}`);
       faviconMeta = await buildFaviconMetaFromTabFavIconUrl(tab.favIconUrl);
       if (faviconMeta) {
-        gsUtils.log(
-          tab.id,
-          'Built faviconMeta from tab.favIconUrl',
-          faviconMeta
-        );
+        gsUtils.log(tab.id, 'Built faviconMeta from tab.favIconUrl', faviconMeta);
+        await saveFaviconMetaDataToCache(originalUrl, faviconMeta);
         return faviconMeta;
       }
     }
-
-    // Else try to fetch from google
-    // if (fallbackToGoogle) {
-    //   const rootUrl = encodeURIComponent(gsUtils.getRootUrl(originalUrl));
-    //   const tabFavIconUrl = GOOGLE_S2_URL + rootUrl;
-    //   //TODO: Handle reject case below
-    //   faviconMeta = await buildFaviconMetaData(tabFavIconUrl, 5000);
-    //   faviconMetaValid = await isFaviconMetaValid(faviconMeta);
-    //   if (faviconMetaValid) {
-    //     gsUtils.log(
-    //       tab.id,
-    //       'Built faviconMeta from google.com/s2 service',
-    //       faviconMeta
-    //     );
-    //     return faviconMeta;
-    //   }
-    // }
-
-    // Else return the default chrome favicon
-    gsUtils.log(tab.id, 'Failed to build faviconMeta. Using default icon');
-    return _defaultChromeFaviconMeta;
-  }
-
-  async function buildFaviconMetaFromChromeFaviconCache(url) {
-    const chromeFavIconUrl = generateChromeFavIconUrlFromUrl(url);
-    gsUtils.log(
-      'gsFavicon',
-      `Building faviconMeta from url: ${chromeFavIconUrl}`
-    );
+    
+    // 2. Try Google S2 Service as a fallback
+    gsUtils.log(tab.id, `Falling back to Google S2 service for: ${originalUrl}`);
+    const s2Url = GOOGLE_S2_URL + encodeURIComponent(originalUrl);
     try {
-      const faviconMeta = await buildFaviconMetaData(chromeFavIconUrl);
-      const faviconMetaValid = await isFaviconMetaValid(faviconMeta);
-      if (faviconMetaValid) {
+      faviconMeta = await buildFaviconMetaData(s2Url);
+      if (await isFaviconMetaValid(faviconMeta)) { // Validate to avoid caching generic Google icons
+        gsUtils.log(tab.id, 'Built faviconMeta from Google S2 service', faviconMeta);
+        await saveFaviconMetaDataToCache(originalUrl, faviconMeta);
         return faviconMeta;
+      } else {
+        gsUtils.log(tab.id, 'Google S2 service returned an invalid or default-like icon.');
       }
     } catch (e) {
-      gsUtils.warning('gsUtils', e);
+      gsUtils.warning('gsFavicon', `Google S2 service failed for ${originalUrl}: ${e}`);
     }
-    return null;
+
+    gsUtils.log(tab.id, 'Failed to build faviconMeta from all sources. Using default icon.');
+    return _processedDefaultFaviconMeta;
   }
 
+  // This function is now effectively a wrapper around buildFaviconMetaData if needed,
+  // or can be removed if direct calls to buildFaviconMetaData with tab.favIconUrl are sufficient.
+  // For now, keeping its structure but it directly calls buildFaviconMetaData.
   async function buildFaviconMetaFromTabFavIconUrl(favIconUrl) {
     try {
-      const faviconMeta = await buildFaviconMetaData(favIconUrl);
-      const faviconMetaValid = await isFaviconMetaValid(faviconMeta);
-      if (faviconMetaValid) {
-        return faviconMeta;
+      const faviconMeta = await buildFaviconMetaData(favIconUrl); 
+      if (await isFaviconMetaValid(faviconMeta)) { // Ensure it's not a default-like icon
+          return faviconMeta;
       }
     } catch (e) {
-      gsUtils.warning('gsUtils', e);
+      gsUtils.warning('gsFavicon', `buildFaviconMetaFromTabFavIconUrl failed for ${favIconUrl}: ${e}`);
     }
     return null;
   }
+  
+  // Removed buildFaviconMetaFromChromeFaviconCache as chrome://favicon is no longer used.
 
   async function getCachedFaviconMetaData(url) {
+    if (!url) return null;
     const fullUrl = gsUtils.getRootUrl(url, true, false);
     let faviconMetaData = await gsIndexedDb.fetchFaviconMeta(fullUrl);
     if (!faviconMetaData) {
@@ -215,6 +247,10 @@ var gsFavicon = (function() {
   }
 
   async function saveFaviconMetaDataToCache(url, faviconMeta) {
+     if (!faviconMeta || typeof faviconMeta !== 'object' || Object.keys(faviconMeta).length === 0) {
+        gsUtils.warning('gsFavicon', `Attempted to save empty or invalid faviconMeta for ${url}. Skipping.`);
+        return;
+    }
     const fullUrl = gsUtils.getRootUrl(url, true, false);
     const rootUrl = gsUtils.getRootUrl(url, false, false);
     gsUtils.log(
@@ -226,51 +262,31 @@ var gsFavicon = (function() {
     await gsIndexedDb.addFaviconMeta(rootUrl, Object.assign({}, faviconMeta));
   }
 
-  // dont use this function as it causes rate limit issues
-  // eslint-disable-next-line no-unused-vars
-  // function fetchFallbackFaviconDataUrl(url) {
-  //   return new Promise(resolve => {
-  //     let imageLoaded = false;
-  //
-  //     const rootUrl = gsUtils.encodeString(gsUtils.getRootUrl(url));
-  //     const requestUrl = GOOGLE_S2_URL + rootUrl;
-  //
-  //     const xmlHTTP = new XMLHttpRequest();
-  //     xmlHTTP.open('GET', requestUrl, true);
-  //
-  //     xmlHTTP.responseType = 'arraybuffer';
-  //     xmlHTTP.onload = function(e) {
-  //       imageLoaded = true;
-  //       const arr = new Uint8Array(xmlHTTP.response);
-  //       const raw = String.fromCharCode.apply(null, arr);
-  //       const b64 = btoa(raw);
-  //       const dataUrl = 'data:image/png;base64,' + b64;
-  //       resolve(dataUrl);
-  //     };
-  //     xmlHTTP.send();
-  //     setTimeout(() => {
-  //       if (!imageLoaded) {
-  //         gsUtils.log('gsFavicon', 'Failed to load image from: ' + url);
-  //         resolve(null);
-  //       }
-  //     }, 3000);
-  //   });
-  // }
 
   async function isFaviconMetaValid(faviconMeta) {
     if (
       !faviconMeta ||
+      !faviconMeta.normalisedDataUrl || // check for actual data existence
       faviconMeta.normalisedDataUrl === 'data:,' ||
+      !faviconMeta.transparentDataUrl || // check for actual data existence
       faviconMeta.transparentDataUrl === 'data:,'
     ) {
       return false;
     }
-    const normalisedFingerprint = await createImageFingerprint(
-      faviconMeta.normalisedDataUrl
-    );
-    const transparentFingerprint = await createImageFingerprint(
-      faviconMeta.transparentDataUrl
-    );
+    
+    let normalisedFingerprint, transparentFingerprint;
+    try {
+        normalisedFingerprint = await createImageFingerprint(
+            faviconMeta.normalisedDataUrl
+        );
+        transparentFingerprint = await createImageFingerprint(
+            faviconMeta.transparentDataUrl
+        );
+    } catch (e) {
+        gsUtils.warning('gsFavicon', `Fingerprint creation failed during validation: ${e}`);
+        return false; // Cannot validate if fingerprinting fails
+    }
+
 
     for (let id of Object.keys(_defaultFaviconFingerprintById)) {
       const defaultFaviconFingerprint = _defaultFaviconFingerprintById[id];
@@ -290,144 +306,29 @@ var gsFavicon = (function() {
     return true;
   }
 
-  // Turns the img into a 16x16 black and white dataUrl
-  function createImageFingerprint(dataUrl) {
-    return new Promise(resolve => {
-      const img = new Image();
-      img.onload = async function() {
-        const canvas = window.document.createElement('canvas');
-        const context = canvas.getContext('2d');
-        const threshold = 80;
-
-        canvas.width = 16;
-        canvas.height = 16;
-        context.drawImage(img, 0, 0, 16, 16);
-
-        const imageData = context.getImageData(0, 0, 16, 16);
-        for (var i = 0; i < imageData.data.length; i += 4) {
-          var luma = Math.floor(
-            imageData.data[i] * 0.3 +
-              imageData.data[i + 1] * 0.59 +
-              imageData.data[i + 2] * 0.11
-          );
-          imageData.data[i] = imageData.data[i + 1] = imageData.data[i + 2] =
-            luma > threshold ? 255 : 0;
-          imageData.data[i + 3] = 255;
-        }
-        context.putImageData(imageData, 0, 0);
-        const fingerprintDataUrl = canvas.toDataURL('image/png');
-        resolve(fingerprintDataUrl);
-      };
-      img.src = dataUrl;
-    });
+  // Turns the img into a 16x16 black and white dataUrl using offscreen document
+  async function createImageFingerprint(dataUrl) {
+    if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image')) {
+        gsUtils.warning('gsFavicon', `Invalid dataUrl provided for createImageFingerprint: ${String(dataUrl).substring(0,100)}`);
+        throw new Error('Invalid dataUrl for createImageFingerprint');
+    }
+    return sendMessageToOffscreenDocument('createImageFingerprint', { dataUrl });
   }
 
-  function buildFaviconMetaData(url) {
-    const timeout = 5 * 1000;
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      // 12-16-2018 ::: @CollinChaffin ::: Anonymous declaration required to prevent terminating cross origin security errors
-      // 12-16-2018 ::: @CollinChaffin ::: http://bit.ly/2BolEqx
-      // 12-16-2018 ::: @CollinChaffin ::: https://bugs.chromium.org/p/chromium/issues/detail?id=409090#c23
-      // 12-16-2018 ::: @CollinChaffin ::: https://bugs.chromium.org/p/chromium/issues/detail?id=718352#c10
-      img.crossOrigin = 'Anonymous';
-      let imageLoaded = false;
-
-      img.onload = () => {
-        imageLoaded = true;
-
-        let canvas;
-        let context;
-        canvas = window.document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
-        context = canvas.getContext('2d');
-        context.drawImage(img, 0, 0);
-
-        let imageData;
-        try {
-          imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-        } catch (e) {
-          reject(e);
-          return;
-        }
-
-        const origDataArray = imageData.data;
-        const normalisedDataArray = new Uint8ClampedArray(origDataArray);
-        const transparentDataArray = new Uint8ClampedArray(origDataArray);
-
-        let r, g, b, a;
-        let fuzzy = 0.1;
-        let light = 0;
-        let dark = 0;
-        let maxAlpha = 0;
-        let maxRgb = 0;
-
-        for (let x = 0; x < origDataArray.length; x += 4) {
-          r = origDataArray[x];
-          g = origDataArray[x + 1];
-          b = origDataArray[x + 2];
-          a = origDataArray[x + 3];
-
-          let localMaxRgb = Math.max(Math.max(r, g), b);
-          if (localMaxRgb < 128 || a < 128) dark++;
-          else light++;
-          maxAlpha = Math.max(a, maxAlpha);
-          maxRgb = Math.max(localMaxRgb, maxRgb);
-        }
-
-        //saftey check to make sure image is not completely transparent
-        if (maxAlpha === 0) {
-          reject(
-            'Aborting favicon generation as image is completely transparent. url: ' +
-              url
-          );
-          return;
-        }
-
-        const darkLightDiff = (light - dark) / (canvas.width * canvas.height);
-        const isDark = darkLightDiff + fuzzy < 0;
-        const normaliserMultiple = 1 / (maxAlpha / 255);
-
-        for (let x = 0; x < origDataArray.length; x += 4) {
-          a = origDataArray[x + 3];
-          normalisedDataArray[x + 3] = parseInt(a * normaliserMultiple, 10);
-        }
-        for (let x = 0; x < normalisedDataArray.length; x += 4) {
-          a = normalisedDataArray[x + 3];
-          transparentDataArray[x + 3] = parseInt(a * 0.5, 10);
-        }
-
-        imageData.data.set(normalisedDataArray);
-        context.putImageData(imageData, 0, 0);
-        const normalisedDataUrl = canvas.toDataURL('image/png');
-
-        imageData.data.set(transparentDataArray);
-        context.putImageData(imageData, 0, 0);
-        const transparentDataUrl = canvas.toDataURL('image/png');
-
-        const faviconMetaData = {
-          favIconUrl: url,
-          isDark,
-          normalisedDataUrl,
-          transparentDataUrl,
-        };
-        resolve(faviconMetaData);
-      };
-      img.src = url;
-      setTimeout(() => {
-        if (!imageLoaded) {
-          reject('Failed to load img.src of: ' + url);
-        }
-      }, timeout);
-    });
+  // Sends URL to offscreen document for processing
+  async function buildFaviconMetaData(url, timeout = 5000) {
+     if (!url || typeof url !== 'string' ) {
+        gsUtils.warning('gsFavicon', `Invalid URL provided for buildFaviconMetaData: ${url}`);
+        throw new Error('Invalid URL for buildFaviconMetaData');
+    }
+    return sendMessageToOffscreenDocument('buildFaviconMetaData', { url, timeout });
   }
 
   return {
     initAsPromised,
     getFaviconMetaData,
     generateChromeFavIconUrlFromUrl,
-    buildFaviconMetaFromChromeFaviconCache,
+    buildFaviconMetaFromChromeFaviconCache, // Retain for direct calls if needed, now uses offscreen
     saveFaviconMetaDataToCache,
   };
 })();
