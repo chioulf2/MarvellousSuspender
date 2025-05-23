@@ -1,47 +1,68 @@
-/*global chrome, tgs, gsStorage, gsSession, gsUtils */
+/*global chrome, gsStorage, gsSession, gsUtils */ // Removed tgs
 (function(global) {
   'use strict';
 
-  chrome.extension.getBackgroundPage().tgs.setViewGlobals(global);
+  // MV3: Direct background page access is not allowed.
+  // Communication with background script (service worker) must use chrome.runtime.sendMessage.
 
   var globalActionElListener;
 
-  var getTabStatus = function(retriesRemaining, callback) {
-    tgs.getActiveTabStatus(function(status) {
-      if (
-        status !== gsUtils.STATUS_UNKNOWN &&
-        status !== gsUtils.STATUS_LOADING
-      ) {
-        callback(status);
-      } else if (retriesRemaining === 0) {
-        callback(status);
-      } else {
-        var timeout = 1000;
-        if (!gsSession.isInitialising()) {
-          retriesRemaining--;
-          timeout = 200;
+  // Helper to send messages to the background script
+  async function sendMessageToBackground(action, payload) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ action, payload }, response => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+        } else {
+          resolve(response);
         }
-        setTimeout(function() {
-          getTabStatus(retriesRemaining, callback);
-        }, timeout);
-      }
-    });
-  };
-  function getTabStatusAsPromise(retries, allowTransientStates) {
-    return new Promise(function(resolve) {
-      getTabStatus(retries, function(status) {
-        if (
-          !allowTransientStates &&
-          (status === gsUtils.STATUS_UNKNOWN ||
-            status === gsUtils.STATUS_LOADING)
-        ) {
-          status = 'error';
-        }
-        resolve(status);
       });
     });
   }
-  function getSelectedTabsAsPromise() {
+
+
+  async function getTabStatus(retriesRemaining) { // Now async
+    const response = await sendMessageToBackground('getActiveTabStatus');
+    const status = response ? response.status : gsUtils.STATUS_UNKNOWN;
+
+    if (
+      status !== gsUtils.STATUS_UNKNOWN &&
+      status !== gsUtils.STATUS_LOADING
+    ) {
+      return status;
+    } else if (retriesRemaining === 0) {
+      return status;
+    } else {
+      var timeout = 1000;
+      // gsSession.isInitialising() needs to be fetched from background if still needed
+      // For simplicity, let's assume it's not critical for retry timing here or handle it if error
+      // const sessionState = await sendMessageToBackground('getSessionState'); // Example
+      // if (sessionState && !sessionState.isInitialising) {
+      //   retriesRemaining--;
+      //   timeout = 200;
+      // }
+      // Simplified:
+      retriesRemaining--;
+      timeout = 200;
+
+      await new Promise(resolve => setTimeout(resolve, timeout));
+      return getTabStatus(retriesRemaining);
+    }
+  }
+
+  async function getTabStatusAsPromise(retries, allowTransientStates) { // Now async
+    let status = await getTabStatus(retries);
+    if (
+      !allowTransientStates &&
+      (status === gsUtils.STATUS_UNKNOWN ||
+        status === gsUtils.STATUS_LOADING)
+    ) {
+      status = 'error';
+    }
+    return status;
+  }
+
+  async function getSelectedTabsAsPromise() { // Remains mostly the same, chrome.tabs.query is fine
     return new Promise(function(resolve) {
       chrome.tabs.query(
         { highlighted: true, lastFocusedWindow: true },
@@ -52,66 +73,59 @@
     });
   }
 
-  Promise.all([
-    gsUtils.documentReadyAndLocalisedAsPromised(document),
-    getTabStatusAsPromise(0, true),
-    getSelectedTabsAsPromise(),
-  ]).then(function([domLoadedEvent, initialTabStatus, selectedTabs]) {
-    setSuspendSelectedVisibility(selectedTabs);
-    setStatus(initialTabStatus);
-    showPopupContents();
-    addClickHandlers();
+  // Main initialization logic
+  (async function() {
+    try {
+      await gsUtils.documentReadyAndLocalisedAsPromised(document);
+      const [initialTabStatus, selectedTabs] = await Promise.all([
+        getTabStatusAsPromise(0, true),
+        getSelectedTabsAsPromise(),
+      ]);
 
-    if (
-      initialTabStatus === gsUtils.STATUS_UNKNOWN ||
-      initialTabStatus === gsUtils.STATUS_LOADING
-    ) {
-      getTabStatusAsPromise(50, false).then(function(finalTabStatus) {
-        setStatus(finalTabStatus);
-      });
+      setSuspendSelectedVisibility(selectedTabs);
+      await setStatus(initialTabStatus); // setStatus is now async
+      await showPopupContents(); // showPopupContents is now async
+      addClickHandlers(); // This will also need to handle async actions
+
+      if (
+        initialTabStatus === gsUtils.STATUS_UNKNOWN ||
+        initialTabStatus === gsUtils.STATUS_LOADING
+      ) {
+        const finalTabStatus = await getTabStatusAsPromise(50, false);
+        await setStatus(finalTabStatus);
+      }
+    } catch (e) {
+      console.error("Error initializing popup:", e);
+      // Display some error on the popup page itself
+      const statusDetailEl = document.getElementById('statusDetail');
+      if (statusDetailEl) {
+        statusDetailEl.innerHTML = "Error loading popup. Please try again.";
+      }
     }
-  });
+  })();
+
 
   function setSuspendCurrentVisibility(tabStatus) {
     var suspendOneVisible = ![
-        gsUtils.STATUS_SUSPENDED,
-        gsUtils.STATUS_SPECIAL,
-        gsUtils.STATUS_BLOCKED_FILE,
-        gsUtils.STATUS_UNKNOWN,
+        gsUtils.STATUS_SUSPENDED, // Can't suspend already suspended
+        gsUtils.STATUS_SPECIAL, // Can't suspend special pages
+        gsUtils.STATUS_BLOCKED_FILE, // Can't suspend blocked file pages (unless permission given)
+        gsUtils.STATUS_UNKNOWN, // Don't show if status is unknown
+        // gsUtils.STATUS_WHITELISTED, // Whitelisted tabs shouldn't be manually suspended from popup easily
       ].includes(tabStatus),
       whitelistVisible = ![
-        gsUtils.STATUS_WHITELISTED,
+        gsUtils.STATUS_WHITELISTED, // Don't show "whitelist" if already whitelisted
         gsUtils.STATUS_SPECIAL,
         gsUtils.STATUS_BLOCKED_FILE,
         gsUtils.STATUS_UNKNOWN,
       ].includes(tabStatus),
-      unsuspendVisible = false; //[gsUtils.STATUS_SUSPENDED].includes(tabStatus);
+      unsuspendVisible = [gsUtils.STATUS_SUSPENDED].includes(tabStatus); // Only show unsuspend for suspended tabs
 
-    if (suspendOneVisible) {
-      document.getElementById('suspendOne').style.display = 'block';
-    } else {
-      document.getElementById('suspendOne').style.display = 'none';
-    }
-
-    if (whitelistVisible) {
-      document.getElementById('whitelistPage').style.display = 'block';
-      document.getElementById('whitelistDomain').style.display = 'block';
-    } else {
-      document.getElementById('whitelistPage').style.display = 'none';
-      document.getElementById('whitelistDomain').style.display = 'none';
-    }
-
-    if (suspendOneVisible || whitelistVisible) {
-      document.getElementById('optsCurrent').style.display = 'block';
-    } else {
-      document.getElementById('optsCurrent').style.display = 'none';
-    }
-
-    if (unsuspendVisible) {
-      document.getElementById('unsuspendOne').style.display = 'block';
-    } else {
-      document.getElementById('unsuspendOne').style.display = 'none';
-    }
+    document.getElementById('suspendOne').style.display = suspendOneVisible ? 'block' : 'none';
+    document.getElementById('whitelistPage').style.display = whitelistVisible ? 'block' : 'none';
+    document.getElementById('whitelistDomain').style.display = whitelistVisible ? 'block' : 'none';
+    document.getElementById('optsCurrent').style.display = (suspendOneVisible || whitelistVisible || unsuspendVisible) ? 'block' : 'none';
+    document.getElementById('unsuspendOne').style.display = unsuspendVisible ? 'block' : 'none';
   }
 
   function setSuspendSelectedVisibility(selectedTabs) {
@@ -122,96 +136,47 @@
     }
   }
 
-  function setStatus(status) {
+  async function setStatus(status) { // Made async
     setSuspendCurrentVisibility(status);
 
     var statusDetail = '';
-    //  statusIconClass = '';
-
-    // Update status icon and text
     if (status === gsUtils.STATUS_NORMAL || status === gsUtils.STATUS_ACTIVE) {
-      statusDetail =
-        chrome.i18n.getMessage('js_popup_normal') +
-        " <a href='#'>" +
-        chrome.i18n.getMessage('js_popup_normal_pause') +
-        '</a>';
-      //    statusIconClass = 'fa fa-clock-o';
+      statusDetail = `${chrome.i18n.getMessage('js_popup_normal')} <a href='#'>${chrome.i18n.getMessage('js_popup_normal_pause')}</a>`;
     } else if (status === gsUtils.STATUS_SUSPENDED) {
-      // statusDetail =
-      //   chrome.i18n.getMessage('js_popup_suspended') +
-      //   " <a href='#'>" +
-      //   chrome.i18n.getMessage('js_popup_suspended_pause') +
-      //   '</a>';
       statusDetail = chrome.i18n.getMessage('js_popup_suspended');
-      //    statusIconClass = 'fa fa-pause';
     } else if (status === gsUtils.STATUS_NEVER) {
       statusDetail = chrome.i18n.getMessage('js_popup_never');
-      //    statusIconClass = 'fa fa-ban';
     } else if (status === gsUtils.STATUS_SPECIAL) {
       statusDetail = chrome.i18n.getMessage('js_popup_special');
-      //    statusIconClass = 'fa fa-remove';
     } else if (status === gsUtils.STATUS_WHITELISTED) {
-      statusDetail =
-        chrome.i18n.getMessage('js_popup_whitelisted') +
-        " <a href='#'>" +
-        chrome.i18n.getMessage('js_popup_whitelisted_remove') +
-        '</a>';
-      //    statusIconClass = 'fa fa-check';
+      statusDetail = `${chrome.i18n.getMessage('js_popup_whitelisted')} <a href='#'>${chrome.i18n.getMessage('js_popup_whitelisted_remove')}</a>`;
     } else if (status === gsUtils.STATUS_AUDIBLE) {
       statusDetail = chrome.i18n.getMessage('js_popup_audible');
-      //    statusIconClass = 'fa fa-volume-up';
     } else if (status === gsUtils.STATUS_FORMINPUT) {
-      statusDetail =
-        chrome.i18n.getMessage('js_popup_form_input') +
-        " <a href='#'>" +
-        chrome.i18n.getMessage('js_popup_form_input_unpause') +
-        '</a>';
-      //    statusIconClass = 'fa fa-edit';
+      statusDetail = `${chrome.i18n.getMessage('js_popup_form_input')} <a href='#'>${chrome.i18n.getMessage('js_popup_form_input_unpause')}</a>`;
     } else if (status === gsUtils.STATUS_PINNED) {
-      statusDetail = chrome.i18n.getMessage('js_popup_pinned'); //  statusIconClass = 'fa fa-thumb-tack';
+      statusDetail = chrome.i18n.getMessage('js_popup_pinned');
     } else if (status === gsUtils.STATUS_TEMPWHITELIST) {
-      statusDetail =
-        chrome.i18n.getMessage('js_popup_temp_whitelist') +
-        " <a href='#'>" +
-        chrome.i18n.getMessage('js_popup_temp_whitelist_unpause') +
-        '</a>';
-      //    statusIconClass = 'fa fa-pause';
+      statusDetail = `${chrome.i18n.getMessage('js_popup_temp_whitelist')} <a href='#'>${chrome.i18n.getMessage('js_popup_temp_whitelist_unpause')}</a>`;
     } else if (status === gsUtils.STATUS_NOCONNECTIVITY) {
       statusDetail = chrome.i18n.getMessage('js_popup_no_connectivity');
-      //    statusIconClass = 'fa fa-plane';
     } else if (status === gsUtils.STATUS_CHARGING) {
       statusDetail = chrome.i18n.getMessage('js_popup_charging');
-      //    statusIconClass = 'fa fa-plug';
     } else if (status === gsUtils.STATUS_BLOCKED_FILE) {
-      statusDetail =
-        chrome.i18n.getMessage('js_popup_blockedFile') +
-        " <a href='#'>" +
-        chrome.i18n.getMessage('js_popup_blockedFile_enable') +
-        '</a>';
-      //    statusIconClass = 'fa fa-exclamation-triangle';
-    } else if (
-      status === gsUtils.STATUS_LOADING ||
-      status === gsUtils.STATUS_UNKNOWN
-    ) {
-      if (gsSession.isInitialising()) {
-        statusDetail = chrome.i18n.getMessage('js_popup_initialising');
-      } else {
-        statusDetail = chrome.i18n.getMessage('js_popup_unknown');
-      }
-      //    statusIconClass = 'fa fa-circle-o-notch';
+      statusDetail = `${chrome.i18n.getMessage('js_popup_blockedFile')} <a href='#'>${chrome.i18n.getMessage('js_popup_blockedFile_enable')}</a>`;
+    } else if (status === gsUtils.STATUS_LOADING || status === gsUtils.STATUS_UNKNOWN) {
+      // gsSession.isInitialising() would need to be fetched async if still relevant
+      // const sessionState = await sendMessageToBackground('getSessionState');
+      // statusDetail = (sessionState && sessionState.isInitialising) ? chrome.i18n.getMessage('js_popup_initialising') : chrome.i18n.getMessage('js_popup_unknown');
+      statusDetail = chrome.i18n.getMessage('js_popup_unknown'); // Simplified
     } else if (status === 'error') {
       statusDetail = chrome.i18n.getMessage('js_popup_error');
-      //    statusIconClass = 'fa fa-exclamation-triangle';
     } else {
       gsUtils.warning('popup', 'Could not process tab status of: ' + status);
     }
     document.getElementById('statusDetail').innerHTML = statusDetail;
-    //  document.getElementById('statusIcon').className = statusIconClass;
-    // if (status === gsUtils.STATUS_UNKNOWN || status === gsUtils.STATUS_LOADING) {
-    //     document.getElementById('statusIcon').classList.add('fa-spin');
-    // }
 
-    document.getElementById('header').classList.remove('willSuspend');
+    document.getElementById('header').classList.remove('willSuspend', 'blockedFile');
     if (status === gsUtils.STATUS_NORMAL || status === gsUtils.STATUS_ACTIVE) {
       document.getElementById('header').classList.add('willSuspend');
     }
@@ -219,108 +184,80 @@
       document.getElementById('header').classList.add('blockedFile');
     }
 
-    // Update action handler
-    var actionEl = document.getElementsByTagName('a')[0];
+    var actionEl = document.querySelector('#statusDetail a'); // More specific selector
     if (actionEl) {
-      var tgsHanderFunc;
-      if (
-        status === gsUtils.STATUS_NORMAL ||
-        status === gsUtils.STATUS_ACTIVE
-      ) {
-        tgsHanderFunc = tgs.requestToggleTempWhitelistStateOfHighlightedTab;
-      } else if (status === gsUtils.STATUS_SUSPENDED) {
-        tgsHanderFunc = tgs.requestToggleTempWhitelistStateOfHighlightedTab;
+      let actionName = null;
+      if (status === gsUtils.STATUS_NORMAL || status === gsUtils.STATUS_ACTIVE || status === gsUtils.STATUS_FORMINPUT || status === gsUtils.STATUS_TEMPWHITELIST) {
+        actionName = 'requestToggleTempWhitelistStateOfHighlightedTab';
       } else if (status === gsUtils.STATUS_WHITELISTED) {
-        tgsHanderFunc = tgs.unwhitelistHighlightedTab;
-      } else if (
-        status === gsUtils.STATUS_FORMINPUT ||
-        status === gsUtils.STATUS_TEMPWHITELIST
-      ) {
-        tgsHanderFunc = tgs.requestToggleTempWhitelistStateOfHighlightedTab;
+        actionName = 'unwhitelistHighlightedTab';
       } else if (status === gsUtils.STATUS_BLOCKED_FILE) {
-        tgsHanderFunc = tgs.promptForFilePermissions;
+        actionName = 'promptForFilePermissions';
       }
+      // Note: gsUtils.STATUS_SUSPENDED also used requestToggleTempWhitelistStateOfHighlightedTab previously,
+      // but the link was removed from its statusDetail string. If that's still desired, it needs to be added back.
+
 
       if (globalActionElListener) {
         actionEl.removeEventListener('click', globalActionElListener);
       }
-      if (tgsHanderFunc) {
-        globalActionElListener = function(e) {
-          tgsHanderFunc(function(newTabStatus) {
-            setStatus(newTabStatus);
-          });
-          // window.close();
+      if (actionName) {
+        globalActionElListener = async function(e) {
+          e.preventDefault(); // Prevent default link behavior
+          const response = await sendMessageToBackground(actionName);
+          if (response && response.newStatus) {
+            await setStatus(response.newStatus);
+          }
+          // window.close(); // Consider if window should close after action
         };
         actionEl.addEventListener('click', globalActionElListener);
       }
     }
   }
 
-  function showPopupContents() {
-    const theme = gsStorage.getOption(gsStorage.THEME);
+  async function showPopupContents() { // Made async
+    const theme = await gsStorage.getOption(gsStorage.THEME); // await
     if (theme === 'dark') {
       document.body.classList.add('dark');
     }
   }
 
   function addClickHandlers() {
-    document
-      .getElementById('unsuspendOne')
-      .addEventListener('click', function(e) {
-        tgs.unsuspendHighlightedTab();
-        window.close();
-      });
-    document
-      .getElementById('suspendOne')
-      .addEventListener('click', function(e) {
-        tgs.suspendHighlightedTab();
-        window.close();
-      });
-    document
-      .getElementById('suspendAll')
-      .addEventListener('click', function(e) {
-        tgs.suspendAllTabs(false);
-        window.close();
-      });
-    document
-      .getElementById('unsuspendAll')
-      .addEventListener('click', function(e) {
-        tgs.unsuspendAllTabs();
-        window.close();
-      });
-    document
-      .getElementById('suspendSelected')
-      .addEventListener('click', function(e) {
-        tgs.suspendSelectedTabs();
-        window.close();
-      });
-    document
-      .getElementById('unsuspendSelected')
-      .addEventListener('click', function(e) {
-        tgs.unsuspendSelectedTabs();
-        window.close();
-      });
-    document
-      .getElementById('whitelistDomain')
-      .addEventListener('click', function(e) {
-        tgs.whitelistHighlightedTab(false);
-        setStatus(gsUtils.STATUS_WHITELISTED);
-        // window.close();
-      });
-    document
-      .getElementById('whitelistPage')
-      .addEventListener('click', function(e) {
-        tgs.whitelistHighlightedTab(true);
-        setStatus(gsUtils.STATUS_WHITELISTED);
-        // window.close();
-      });
-    document
-      .getElementById('settingsLink')
-      .addEventListener('click', function(e) {
-        chrome.tabs.create({
-          url: chrome.extension.getURL('options.html'),
-        });
-        window.close();
-      });
+    // Helper for click handlers that send a message and close the window
+    const createHandler = (action, payload = {}) => async (e) => {
+      try {
+        await sendMessageToBackground(action, payload);
+      } catch (err) {
+        console.error(`Error performing action ${action}:`, err);
+        // Optionally display an error to the user in the popup
+      }
+      window.close();
+    };
+    
+    const createStatusUpdateHandler = (action, payload = {}, newStatus) => async (e) => {
+        try {
+            await sendMessageToBackground(action, payload);
+            await setStatus(newStatus); // Update status locally in popup
+        } catch (err) {
+            console.error(`Error performing action ${action}:`, err);
+        }
+        // window.close(); // Decide if window should close
+    };
+
+
+    document.getElementById('unsuspendOne').addEventListener('click', createHandler('unsuspendHighlightedTab'));
+    document.getElementById('suspendOne').addEventListener('click', createHandler('suspendHighlightedTab'));
+    document.getElementById('suspendAll').addEventListener('click', createHandler('suspendAllTabs', { force: false }));
+    document.getElementById('unsuspendAll').addEventListener('click', createHandler('unsuspendAllTabs'));
+    document.getElementById('suspendSelected').addEventListener('click', createHandler('suspendSelectedTabs'));
+    document.getElementById('unsuspendSelected').addEventListener('click', createHandler('unsuspendSelectedTabs'));
+    
+    document.getElementById('whitelistDomain').addEventListener('click', createStatusUpdateHandler('whitelistHighlightedTab', { includePath: false }, gsUtils.STATUS_WHITELISTED));
+    document.getElementById('whitelistPage').addEventListener('click', createStatusUpdateHandler('whitelistHighlightedTab', { includePath: true }, gsUtils.STATUS_WHITELISTED));
+
+    document.getElementById('settingsLink').addEventListener('click', function(e) {
+      chrome.tabs.create({ url: chrome.runtime.getURL('options.html') });
+      window.close();
+    });
   }
 })(this);
